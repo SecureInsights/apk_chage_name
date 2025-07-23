@@ -15,6 +15,9 @@ if not NEW_NAME:
     print("❌ 应用名称不能为空")
     exit(1)
 
+# 新增：获取用户输入的新包名（留空保持原包名）
+NEW_PKG = input("请输入新的包名（留空保持原包名）: ").strip()
+
 # 获取用户输入的源APK文件路径
 apk_in = input("请输入源APK文件路径 (直接回车使用默认值'app-release.apk'): ").strip()
 APK_IN = Path(apk_in if apk_in else "app-release.apk")
@@ -35,10 +38,8 @@ APKSIGNER_JAR = Path("apksigner.jar")
 # 工作目录
 WORK_DIR = Path("./apk_workdir")
 
-
 JAVA_PATH = "java"
 ZIPALIGN = "zipalign"
-
 
 # ------------------------------------------------------------------
 # 生成签名文件
@@ -87,13 +88,11 @@ def patch_manifest_and_optimize(src: Path, dst: Path, new_name: str) -> None:
 
     print("📦 解码APK文件...")
     try:
-        # 保持原始命令参数不变
         decode_args = [
             str(JAVA_PATH), "-jar", str(APKTOOL_JAR), 
             "d", "-v", "-o", str(decoded_dir), str(src),
             "--no-src"
         ]
-        
         result = run(decode_args, check=True, capture_output=True, text=True)
     except CalledProcessError as e:
         print(f"❌ APK解码失败: {e.stderr}")
@@ -108,7 +107,6 @@ def patch_manifest_and_optimize(src: Path, dst: Path, new_name: str) -> None:
     # 检查并修改AndroidManifest.xml
     manifest_path = decoded_dir / "AndroidManifest.xml"
     if not manifest_path.exists():
-        # 尝试从替代位置查找
         alt_manifest = decoded_dir / "original" / "AndroidManifest.xml"
         if alt_manifest.exists():
             print(f"⚠️ 使用替代清单文件: {alt_manifest}")
@@ -129,12 +127,21 @@ def patch_manifest_and_optimize(src: Path, dst: Path, new_name: str) -> None:
     if app_pattern.search(manifest_data):
         manifest_data = app_pattern.sub(f'\\1"{new_name}"', manifest_data)
     else:
-        # 如果找不到application标签内的label，尝试添加一个
         app_tag_pattern = re.compile(r'(<application\s[^>]*?)>', re.IGNORECASE)
         if app_tag_pattern.search(manifest_data):
             manifest_data = app_tag_pattern.sub(f'\\1 android:label="{new_name}">', manifest_data)
         else:
             print("⚠️ 未找到application标签，无法修改应用名称")
+
+    # 新增：修改包名（若提供）
+    old_pkg = None
+    if NEW_PKG:
+        old_pkg_match = re.search(r'package="([^"]+)"', manifest_data, re.IGNORECASE)
+        if old_pkg_match:
+            old_pkg = old_pkg_match.group(1)
+            manifest_data = re.sub(r'package="[^"]+"', f'package="{NEW_PKG}"', manifest_data, flags=re.IGNORECASE)
+            # 简单替换 authorities 等全限定前缀
+            manifest_data = manifest_data.replace(f'"{old_pkg}.', f'"{NEW_PKG}.')
     
     try:
         with open(manifest_path, "w", encoding="utf-8") as f:
@@ -143,15 +150,30 @@ def patch_manifest_and_optimize(src: Path, dst: Path, new_name: str) -> None:
         print(f"❌ 写入清单文件失败: {str(e)}")
         raise
     
+    # 新增：同步 smali 目录及常量（仅简单场景）
+    if NEW_PKG and old_pkg:
+        old_java = old_pkg.replace('.', '/')
+        new_java = NEW_PKG.replace('.', '/')
+        # 1) 改 smali 目录
+        for smali_root in decoded_dir.glob('smali*'):
+            old_path = smali_root / old_java
+            new_path = smali_root / new_java
+            if old_path.exists() and not new_path.exists():
+                new_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(old_path), str(new_path))
+        # 2) 改 smali 文件中的常量
+        for smali_file in decoded_dir.rglob("*.smali"):
+            txt = smali_file.read_text(encoding="utf-8", errors="ignore")
+            txt = txt.replace(f"L{old_java}/", f"L{new_java}/")
+            smali_file.write_text(txt, encoding="utf-8")
+    
     # 重新打包APK
     print("📦 重新打包APK...")
     try:
-        # 保持原始命令参数不变
         build_args = [
             str(JAVA_PATH), "-jar", str(APKTOOL_JAR), 
             "b", "-v", "-f", "-o", str(dst), str(decoded_dir)
         ]
-        
         result = run(build_args, check=True, capture_output=True, text=True)
     except CalledProcessError as e:
         print(f"❌ APK打包失败: {e.stderr}")
@@ -167,20 +189,16 @@ def zipalign_apk(input_apk: Path, output_apk: Path) -> None:
     """使用zipalign工具优化APK，提高兼容性"""
     print("📏 对齐APK文件...")
     try:
-        # 删除可能存在的输出文件
         if output_apk.exists():
             output_apk.unlink()
-            
-        # 保持原始命令参数不变
         run([
-            str(ZIPALIGN), "-v", "4",  # 4字节对齐，Android要求的标准
+            str(ZIPALIGN), "-v", "4",
             str(input_apk),
             str(output_apk)
         ], check=True, capture_output=True, text=True)
         print("✅ APK对齐完成")
     except CalledProcessError as e:
         print(f"❌ APK对齐失败: {e.stderr}")
-        # 尝试复制原始文件继续处理，作为降级方案
         try:
             shutil.copy2(str(input_apk), str(output_apk))
             print("⚠️ 继续使用未对齐的APK，可能导致安装失败")
@@ -189,7 +207,6 @@ def zipalign_apk(input_apk: Path, output_apk: Path) -> None:
             raise
     except FileNotFoundError:
         print("❌ 未找到zipalign工具，无法对齐APK")
-        # 复制原始文件继续处理
         try:
             shutil.copy2(str(input_apk), str(output_apk))
             print("⚠️ 继续使用未对齐的APK，可能导致安装失败")
@@ -208,13 +225,9 @@ def sign_apk(unsigned_apk: Path, signed_apk: Path) -> None:
     print("🔐 签名APK文件...")
     
     if signed_apk.exists():
-        try:
-            signed_apk.unlink()
-        except Exception as e:
-            print(f"⚠️ 无法删除旧签名文件: {str(e)}")
+        signed_apk.unlink()
     
     try:
-        # 保持原始命令参数不变
         run([
             str(JAVA_PATH), "-jar", str(APKSIGNER_JAR),
             "sign",
@@ -241,7 +254,7 @@ def sign_apk(unsigned_apk: Path, signed_apk: Path) -> None:
         print(f"❌ 签名过程发生错误: {str(e)}")
         raise
     
-    # 详细验证签名
+    # 验证签名
     print("✅ 验证签名...")
     try:
         result = run([
@@ -265,124 +278,72 @@ def sign_apk(unsigned_apk: Path, signed_apk: Path) -> None:
 # ------------------------------------------------------------------
 def main():
     try:
-        # 检查输入APK是否存在
         if not APK_IN.exists():
             print(f"❌ 输入APK文件不存在: {APK_IN}")
             return
         
-        # 检查并生成签名文件
         if not KEYSTORE_PATH.exists():
             print(f"⚠️ 未找到签名文件: {KEYSTORE_PATH}")
             try:
-                
-                # 用于存储用户输入
                 response = {'value': None}
-                
-                # 获取用户输入的函数
                 def get_input():
                     response['value'] = input("是否生成新的签名文件? (y/n) ").lower()
-                
-                # 创建输入线程
                 input_thread = threading.Thread(target=get_input)
                 input_thread.daemon = True
                 input_thread.start()
-                
-                # 等待5秒或用户输入
                 input_thread.join(timeout=5)
-                
-                # 如果5秒内没有输入，自动设为'y'
                 if response['value'] is None:
                     print("\n⏰ 等待超时，自动继续...")
                     response['value'] = 'y'
-                
                 if response['value'] != 'y':
                     print("🔚 用户取消操作")
                     return
-                    
                 if not generate_keystore():
                     print("🔚 生成签名文件失败，退出流程")
                     return
-                    
             except KeyboardInterrupt:
                 print("\n🔚 用户取消操作")
                 return
         
-        # 确保工作目录存在
-        try:
-            WORK_DIR.mkdir(exist_ok=True)
-        except Exception as e:
-            print(f"❌ 无法创建工作目录: {str(e)}")
-            return
+        WORK_DIR.mkdir(exist_ok=True)
         
-        # 步骤1: 修改AndroidManifest.xml
         patched_apk = WORK_DIR / "patched_unsigned.apk"
-        try:
-            patch_manifest_and_optimize(APK_IN, patched_apk, NEW_NAME)
-            if not patched_apk.exists():
-                raise FileNotFoundError("修改后的APK文件未生成")
-        except Exception as e:
-            print(f"🔚 修改APK失败: {str(e)}")
-            return
+        patch_manifest_and_optimize(APK_IN, patched_apk, NEW_NAME)
+        if not patched_apk.exists():
+            raise FileNotFoundError("修改后的APK文件未生成")
         
-        # 步骤2: 对齐APK
         aligned_apk = WORK_DIR / "patched_aligned.apk"
-        try:
-            zipalign_apk(patched_apk, aligned_apk)
-            if not aligned_apk.exists():
-                raise FileNotFoundError("对齐后的APK文件未生成")
-        except Exception as e:
-            print(f"🔚 APK对齐失败: {str(e)}")
-            return
+        zipalign_apk(patched_apk, aligned_apk)
+        if not aligned_apk.exists():
+            raise FileNotFoundError("对齐后的APK文件未生成")
         
-        # 步骤3: 签名APK
         signed_apk = WORK_DIR / "patched_signed.apk"
-        try:
-            sign_apk(aligned_apk, signed_apk)
-            if not signed_apk.exists():
-                raise FileNotFoundError("签名后的APK文件未生成")
-        except Exception as e:
-            print(f"🔚 APK签名失败: {str(e)}")
-            return
+        sign_apk(aligned_apk, signed_apk)
+        if not signed_apk.exists():
+            raise FileNotFoundError("签名后的APK文件未生成")
         
-        # 步骤4: 拷贝最终结果
-        try:
-            if APK_OUT.exists():
-                APK_OUT.unlink()
-            shutil.move(str(signed_apk), APK_OUT)
-            print(f"🎉 操作完成！生成文件: {APK_OUT.resolve()}")
-            
-        except Exception as e:
-            print(f"❌ 无法复制最终文件: {str(e)}")
-            print(f"💡 可手动获取签名后的文件: {signed_apk}")
-    
+        if APK_OUT.exists():
+            APK_OUT.unlink()
+        shutil.move(str(signed_apk), APK_OUT)
+        print(f"🎉 操作完成！生成文件: {APK_OUT.resolve()}")
+        
     except KeyboardInterrupt:
         print("\n🔚 用户中断操作")
     except Exception as e:
         print(f"❌ 发生错误: {str(e)}")
     finally:
-        # 清理工作目录
         if WORK_DIR.exists():
             try:
-                # 用于存储用户输入
                 response = {'value': None}
-                
-                # 获取用户输入的函数
                 def get_input():
                     response['value'] = input("是否清理临时文件? (y/n) ").lower()
-                
-                # 创建输入线程
                 input_thread = threading.Thread(target=get_input)
                 input_thread.daemon = True
                 input_thread.start()
-                
-                # 等待5秒或用户输入
                 input_thread.join(timeout=5)
-                
-                # 如果5秒内没有输入，自动设为'y'
                 if response['value'] is None:
                     print("\n⏰ 等待超时，自动继续...")
                     response['value'] = 'y'
-                
                 if response['value'] == 'y':
                     shutil.rmtree(WORK_DIR, ignore_errors=True)
                     print("🧹 临时文件已清理")
